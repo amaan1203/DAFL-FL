@@ -12,6 +12,8 @@ class LinearLayer(nn.Module):
         self.fc = nn.Linear(self.input_dimension, self.num_classes, bias=bias)
 
     def forward(self, x):
+        # Add this line to flatten the input image tensor
+        x = x.view(x.size(0), -1)
         return self.fc(x)
 
 
@@ -133,6 +135,22 @@ def get_resnet18(n_classes):
     :return: nn.Module
     """
     model = models.resnet18(pretrained=True)
+    model.fc = nn.Linear(model.fc.in_features, n_classes)
+
+    return model
+
+
+def get_resnet18_cifar(n_classes):
+    """
+    creates Resnet model adapted for 32x32 images with `n_classes` outputs
+    :param n_classes:
+    :return: nn.Module
+    """
+    model = models.resnet18(pretrained=True)
+    # Replace initial 7x7 conv with 3x3 to preserve spatial resolution of 32x32 images
+    model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+    # Remove maxpool to prevent further early spatial shrinkage
+    model.maxpool = nn.Identity()
     model.fc = nn.Linear(model.fc.in_features, n_classes)
 
     return model

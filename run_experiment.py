@@ -11,8 +11,14 @@ This file can also be imported as a module and contains the following function:
 
 """
 
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning, module="sklearn")
+from secure_aggregator import SecureAggregator 
+
+
 from utils.args import *
 from utils.utils import *
+
 
 from torch.utils.tensorboard import SummaryWriter
 
@@ -38,8 +44,19 @@ def check_args(args_):
 
 
 def build_experiment(args_, seed_):
+    """function to build aggregator and clients_sampler ready for federated learning simulation"""    
+
+    # Construct the full, nested path that plots.py expects-> islie yeh structure is added
+    experiment_name_folder = f"activity_{args_.experiment}"
+    seed_folder = f"seed_{seed_}"
+    full_experiment_path = os.path.join(args_.logs_dir, experiment_name_folder, seed_folder)
+
+    
     with open(args_.cfg_file_path, "r") as f:
         all_clients_cfg = json.load(f)
+
+    num_clients = len(all_clients_cfg)
+    threshold = args_.threshold  # from --threshold CLI argument (default 5)
 
     clients_dict = dict()
     n_samples_per_client = dict()
@@ -48,7 +65,7 @@ def build_experiment(args_, seed_):
     for client_id in tqdm(all_clients_cfg.keys(), position=0, leave=True):
         data_dir = all_clients_cfg[client_id]["task_dir"]
 
-        logs_dir = os.path.join(args_.logs_dir, f"client_{client_id}")
+        logs_dir = os.path.join(full_experiment_path, f"client_{client_id}")
         os.makedirs(logs_dir, exist_ok=True)
         logger = SummaryWriter(logs_dir)
 
@@ -56,10 +73,13 @@ def build_experiment(args_, seed_):
                 args=args_,
                 client_id=client_id,
                 data_dir=data_dir,
-                logger=logger
+                logger=logger,
+                num_clients=num_clients,
+                threshold=threshold,
             )
         n_samples_per_client[client_id] = clients_dict[int(client_id)].num_samples
-
+    
+    #this weight is used in fedaveraging to see the contribution of each client in the global model
     clients_weights_dict = get_clients_weights(
         objective_type=args_.objective_type,
         n_samples_per_client=n_samples_per_client
@@ -74,7 +94,7 @@ def build_experiment(args_, seed_):
             seed=args_.seed
         )
 
-    global_logs_dir = os.path.join(args_.logs_dir, "global")
+    global_logs_dir = os.path.join(full_experiment_path, "global")
     os.makedirs(global_logs_dir, exist_ok=True)
     global_logger = SummaryWriter(global_logs_dir)
 
@@ -86,7 +106,8 @@ def build_experiment(args_, seed_):
             global_trainer=global_trainer,
             logger=global_logger,
             verbose=args_.verbose,
-            seed=args_.seed
+            seed=args_.seed,
+            threshold=threshold,
         )
 
     print("\n=> Compute local optimums")
@@ -132,6 +153,7 @@ if __name__ == "__main__":
     torch.backends.cudnn.benchmark = False
 
     args = parse_args()
+    
 
     check_args(args)
 

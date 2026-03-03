@@ -3,6 +3,7 @@ import json
 import warnings
 
 import matplotlib.pyplot as plt
+import numpy as np
 
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
@@ -68,7 +69,7 @@ BAR_POSITION = {
 LEGEND = {
     "fast": "F3AST",
     "adafed": "AdaFed",
-    "markov": "CA-Fed (Ours)",
+    "markov": "Our Proposed FL",
     "unbiased": "Unbiased",
     "true": r"Target",
     "expected": "Expected",
@@ -115,16 +116,17 @@ def parse_tf_events_file(events_path, tag):
         * Tuple(List, List): list of steps and the corresponding values
 
     """
-    ea = EventAccumulator(events_path).Reload()
-
-    tag_values = []
-    steps = []
-
-    for event in ea.Scalars(tag):
-        tag_values.append(event.value)
-        steps.append(event.step)
-
-    return steps, tag_values
+    try:
+        ea = EventAccumulator(events_path).Reload()
+        tag_values = []
+        steps = []
+        for event in ea.Scalars(tag):
+            tag_values.append(event.value)
+            steps.append(event.step)
+        return steps, tag_values
+    except Exception as e:
+        print(f"Warning: Could not read tf events file for tag '{tag}' at path '{events_path}'. Error: {e}")
+        return [], []
 
 
 def parse_history_file(history_path):
@@ -189,34 +191,45 @@ def parse_history_file(history_path):
 
 def gather_history(history_dir):
     """
+    Gathers history from JSON files in a directory structure.
 
     Parameters
     ----------
     history_dir: str
+        The root directory containing experiment history.
 
     Returns
     -------
-        * Dict[str: Dict[int: List[numpy.array]]
+    Dict[str, Dict[int, Tuple]]
+        A dictionary mapping activity type to seed to history data.
     """
     history_dict = dict()
+    if not os.path.exists(history_dir):
+        print(f"Warning: History directory not found at '{history_dir}'")
+        return history_dict
 
-    for activity_dir in os.listdir(history_dir):
-        activity = activity_dir.split("_")[-1]
+    for activity_item in os.listdir(history_dir):
+        activity_path = os.path.join(history_dir, activity_item)
+        if not os.path.isdir(activity_path):
+            continue
 
-        activity_dir = os.path.join(history_dir, activity_dir)
-
+        activity = activity_item.split("_")[-1]
         history_dict[activity] = dict()
 
-        for seed_file in os.listdir(activity_dir):
-            seed = int(seed_file.split(".")[0].split("_")[-1])
-
-            history_path = os.path.join(activity_dir, seed_file)
-
-            clients_activities, clients_weights, true_weights, true_availability, clients_ids = \
-                parse_history_file(history_path)
-
-            history_dict[activity][seed] = \
-                (clients_activities, clients_weights, true_weights, true_availability, clients_ids)
+        for seed_item in os.listdir(activity_path):
+            seed_path = os.path.join(activity_path, seed_item)
+            if not os.path.isfile(seed_path) or not seed_item.endswith(".json"):
+                continue
+            
+            try:
+                seed = int(seed_item.split(".")[0].split("_")[-1])
+                clients_activities, clients_weights, true_weights, true_availability, clients_ids = \
+                    parse_history_file(seed_path)
+                history_dict[activity][seed] = \
+                    (clients_activities, clients_weights, true_weights, true_availability, clients_ids)
+            except (ValueError, IndexError):
+                print(f"Warning: Could not parse seed from filename '{seed_item}'. Skipping.")
+                continue
 
     return history_dict
 
@@ -370,6 +383,9 @@ def plot_all_history(history_dir, save_dir):
     os.makedirs(save_dir, exist_ok=True)
 
     history_dict = gather_history(history_dir)
+    if not history_dict:
+        print("No history found to plot.")
+        return
 
     cumulative_weights_fig, cumulative_weights_ax = plt.subplots(figsize=FIG_SIZE)
     observed_activities_fig, observed_activities_ax = plt.subplots(figsize=FIG_SIZE)
@@ -381,6 +397,9 @@ def plot_all_history(history_dir, save_dir):
     clients_ids = []
 
     for method in METHODS:
+        if method not in history_dict:
+            continue
+            
         clients_activities_array = []
         clients_weights_array = []
         true_weights_array = []
@@ -397,11 +416,14 @@ def plot_all_history(history_dir, save_dir):
             true_availability_array.append(true_availability)
             clients_ids_array.append(clients_ids)
 
-        clients_activities = np.array(clients_activities_array)  # shape = (n_trials, n_steps, n_clients)
-        clients_weights = np.array(clients_weights_array)  # shape = (n_trials, n_steps, n_clients)
-        true_weights = np.array(true_weights_array)  # shape = (n_trials, n_clients)
-        true_availability = np.array(true_availability_array)  # shape = (n_trials, n_clients)
-        clients_ids = np.array(clients_ids_array)  # shape = (n_trials, n_clients)
+        if not clients_ids_array:
+            continue
+
+        clients_activities = np.array(clients_activities_array)
+        clients_weights = np.array(clients_weights_array)
+        true_weights = np.array(true_weights_array)
+        true_availability = np.array(true_availability_array)
+        clients_ids = np.array(clients_ids_array)
 
         bar_plots(
             ax=cumulative_weights_ax,
@@ -420,9 +442,10 @@ def plot_all_history(history_dir, save_dir):
                 width=LARGE_BAR_WIDTH
             )
 
-        cumulative_weights = \
-            clients_weights.mean(axis=0).cumsum(axis=0) / \
-            clients_weights.mean(axis=0).cumsum(axis=0).sum(axis=1, keepdims=True)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            cumulative_weights = \
+                clients_weights.mean(axis=0).cumsum(axis=0) / \
+                clients_weights.mean(axis=0).cumsum(axis=0).sum(axis=1, keepdims=True)
 
         cumulative_weights = np.nan_to_num(cumulative_weights)
 
@@ -442,6 +465,10 @@ def plot_all_history(history_dir, save_dir):
             divergence_metric=chi2_distance
         )
 
+    if true_weights.size == 0 or clients_ids.size == 0:
+        print("Not enough data to plot summary bars.")
+        return
+        
     bar_plots(
         ax=cumulative_weights_ax,
         method="true",
@@ -524,7 +551,7 @@ def plot_participation_heatmap(history_dir, save_dir):
     history_dict = gather_history(history_dir)
 
     if "markov" not in history_dict:
-        warnings.warn(RuntimeWarning, "'markov' is not found in history, no plot is generated")
+        warnings.warn("'markov' is not found in history, no plot is generated", RuntimeWarning)
         return
 
     for seed in history_dict["markov"]:
@@ -557,40 +584,26 @@ def plot_participation_heatmap(history_dir, save_dir):
 
 
 def gather_logs(logs_dir, tag):
-    """Gathers the log results
-
-    Gathers the log results, stored in multiple tf.events files, into a single dictionary
-
-    Parameters
-    ----------
-    logs_dir: str
-
-    tag: str
-        name of the tag to extract
-
-    Returns
-    -------
-        * Dict[str: Dict[int: Tuple[List[int], List[float]]]
-
+    """
+    CORRECTED log gatherer for the FLAT directory structure created by run_experiment.py.
+    It looks for the 'global' folder directly inside the provided logs_dir.
     """
     logs_dict = dict()
 
-    for activity_dir in os.listdir(logs_dir):
-        activity = activity_dir.split("_")[-1]
+    # The global log directory is expected to be directly inside the logs_dir
+    global_events_dir = os.path.join(logs_dir, "global")
 
-        activity_dir = os.path.join(logs_dir, activity_dir)
+    if not os.path.exists(global_events_dir):
+        # This is the only check we need now.
+        return logs_dict # Return empty dict if the global folder is missing
 
-        logs_dict[activity] = dict()
+    steps, values = parse_tf_events_file(global_events_dir, tag=tag)
 
-        for seed_dir in os.listdir(activity_dir):
-            seed = int(seed_dir.split("_")[-1])
-
-            events_dir = os.path.join(activity_dir, seed_dir, "global")
-
-            steps, values = parse_tf_events_file(events_dir, tag=tag)
-
-            logs_dict[activity][seed] = (steps, values)
-
+    if values:
+        # We use a dummy method ('markov') and seed (42) to fit the data structure
+        # that the plot_logs_dict function expects to receive.
+        logs_dict["markov"] = {42: (steps, values)}
+    
     return logs_dict
 
 
@@ -614,9 +627,18 @@ def smooth_results(results_array, steps, discount_coeff=1.0):
     if discount_coeff <= 1e-2:
         return results_array
 
-    discount_factors = np.power(1 / discount_coeff, steps)
+    # Ensure steps is a numpy array for vectorized operations
+    steps = np.array(steps)
+    
+    # Handle empty or inconsistent steps/results
+    if steps.size == 0 or results_array.shape[1] != steps.size:
+        return np.array([]) # Return empty array if there's a mismatch
 
-    discount_factors /= discount_factors.cumsum()
+    with np.errstate(divide='ignore', invalid='ignore'):
+        discount_factors = np.power(1 / discount_coeff, steps)
+        discount_factors_cumsum = discount_factors.cumsum()
+        # Avoid division by zero if the cumsum is zero
+        discount_factors = np.divide(discount_factors, discount_factors_cumsum, out=np.zeros_like(discount_factors), where=discount_factors_cumsum!=0)
 
     smooth_results_array = results_array.cumsum(axis=1) * discount_factors
 
@@ -646,30 +668,42 @@ def plot_logs_dict(logs_dict, discount_coeff, tag, save_path):
     fig, ax = plt.subplots(figsize=FIG_SIZE)
 
     for method in METHODS:
-
+        if method not in logs_dict:
+            continue
+            
         results_array = []
-
-        steps = list()
+        steps_list = []
 
         for seed in logs_dict[method]:
             steps, values = logs_dict[method][seed]
-            results_array.append(values)
+            # Ensure consistent lengths for np.array conversion
+            if steps:
+                steps_list.append(steps)
+                results_array.append(values)
+        
+        # Skip method if no valid data was found
+        if not results_array:
+            continue
 
-        results_array = np.array(results_array)
-
+        # Pad shorter runs to the length of the longest run to create a rectangular array
+        max_len = max(len(r) for r in results_array)
+        results_array_padded = np.array([r + [r[-1]] * (max_len - len(r)) for r in results_array])
+        steps = steps_list[np.argmax([len(s) for s in steps_list])] # Use steps from the longest run
+        
         smooth_results_array = \
-            smooth_results(results_array=results_array, steps=steps, discount_coeff=discount_coeff)
+            smooth_results(results_array=results_array_padded, steps=steps, discount_coeff=discount_coeff)
 
-        ax.plot(
-            steps,
-            smooth_results_array.mean(axis=0),
-            linewidth=LINE_WIDTH,
-            marker=MARKERS[method],
-            markersize=MARKER_SIZE,
-            markeredgewidth=MARKER_WIDTH,
-            label=f"{LEGEND[method]}",
-            color=COLORS[method]
-        )
+        if smooth_results_array.size > 0:
+            ax.plot(
+                steps,
+                smooth_results_array.mean(axis=0),
+                linewidth=LINE_WIDTH,
+                marker=MARKERS[method],
+                markersize=MARKER_SIZE,
+                markeredgewidth=MARKER_WIDTH,
+                label=f"{LEGEND[method]}",
+                color=COLORS[method]
+            )
 
     ax.grid(True, linewidth=2)
 
@@ -707,6 +741,10 @@ def plot_all_logs(logs_dir, save_dir):
 
     for tag in FILES_NAMES:
         logs_dict = gather_logs(logs_dir, tag)
+        
+        if not any(logs_dict.values()): # Check if any data was gathered
+            print(f"No log data found for tag '{tag}' in directory '{logs_dir}'. Skipping plot.")
+            continue
 
         plot_logs_dict(
             logs_dict=logs_dict,

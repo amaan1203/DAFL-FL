@@ -171,6 +171,28 @@ def parse_args(args_list=None):
         type=int,
         default=argparse.SUPPRESS
     )
+        # Add these two lines right before "if args_list:"
+    parser.add_argument(
+        '--secure_aggregation',
+        help='Use secure aggregation with secret sharing',
+        action='store_true'
+    )
+
+    parser.add_argument(
+        '--threshold_ratio',
+        help='Threshold ratio for secret sharing (fraction of total clients)',
+        type=float,
+        default=0.5
+    )
+
+    parser.add_argument(
+        '--threshold',
+        help='Absolute number of shares required for secret reconstruction; '
+             'default is 5. Must be <= number of sampled clients per round.',
+        type=int,
+        default=5
+    )
+
 
     if args_list:
         args = parser.parse_args(args_list)
