@@ -189,10 +189,7 @@ class SecureClient:
         return deltas
 
     def create_parameter_shares(self, participating_clients_ids: list) -> dict:
-        """Generate one unique SSS share per participant for each parameter delta.
-
-        Each participant receives a different (x, y) point on the secret polynomial.
-        This guarantees share uniqueness as required by Shamir's scheme.
+        """Generate one unique SSS share per participant for each parameter delta using vectorization.
 
         Parameters
         ----------
@@ -204,36 +201,49 @@ class SecureClient:
         dict
             { recipient_client_id -> { param_name -> [{'pos': pos, 'share': (x,y)}, ...] } }
         """
+        from secret_sharing import generate_shares_vectorized
+
         deltas = self.get_parameter_deltas()
 
         if not deltas:
             print(f"[Client {self.client_id}] WARNING: parameter deltas are empty.")
 
         n_participants = len(participating_clients_ids)
-        # Map list index → actual client_id for share assignment
         participant_map = {i: cid for i, cid in enumerate(participating_clients_ids)}
 
-        # Initialise output structure
         shares_for_clients = {cid: {} for cid in participating_clients_ids}
 
         for param_name, delta_tensor in deltas.items():
-            # Accumulate per-recipient share lists for this parameter
             shares_for_clients_param = {cid: [] for cid in participating_clients_ids}
 
-            for pos in np.ndindex(delta_tensor.shape):
-                value = delta_tensor[pos].item()
-                # Convert float delta to integer by scaling
-                secret = int(round(value * SCALE_FACTOR))
+            # Flatten the tensor to vectorise over all elements at once
+            shape = delta_tensor.shape
+            delta_flat = delta_tensor.flatten().detach().cpu().numpy()
 
-                # generate_shares returns n distinct (x, y) points — one per participant
-                shares = generate_shares(n_participants, self.threshold, secret)
+            # Convert to integers by scaling safely
+            secrets_arr = np.round(delta_flat * SCALE_FACTOR).astype(np.int64)
 
-                for i, share in enumerate(shares):
-                    recipient_id = participant_map[i]
-                    shares_for_clients_param[recipient_id].append({
-                        'pos': pos,
-                        'share': share
-                    })
+            # Generate shares for the entire tensor in one C++ vectorized call
+            # x_values is a list of len `n_participants`
+            # y_values_matrix is (n_participants, N)
+            x_values, y_values_matrix = generate_shares_vectorized(n_participants, self.threshold, secrets_arr)
+
+            # Map the flat indices back to their multi-dimensional coordinates
+            # This is necessary because the aggregator's buffer reconstructs param-by-param
+            all_positions = list(np.ndindex(shape))
+
+            for i in range(n_participants):
+                recipient_id = participant_map[i]
+                x_val = x_values[i]
+                y_vals = y_values_matrix[i]
+                
+                # Bundle the pos with its (x, y) share
+                shares_list = [
+                    {'pos': pos, 'share': (x_val, int(y))}
+                    for pos, y in zip(all_positions, y_vals)
+                ]
+                
+                shares_for_clients_param[recipient_id] = shares_list
 
             for cid in participating_clients_ids:
                 shares_for_clients[cid][param_name] = shares_for_clients_param[cid]
