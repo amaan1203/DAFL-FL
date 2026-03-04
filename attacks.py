@@ -42,11 +42,14 @@ def apply_update_attack(
         Modified delta dict.
     """
     if attack == "scaling":
-        s = float(rng.uniform(params.get("min", 3.0), params.get("max", 10.0)))
-        return {k: v * s for k, v in delta_dict.items()}
+        # Rather than scaling the delta (which might just jump to a local optimum),
+        # we completely randomize it with a massive magnitude to destroy the model.
+        s = float(rng.uniform(params.get("min", 20.0), params.get("max", 50.0)))
+        return {k: torch.randn_like(v) * s for k, v in delta_dict.items()}
 
     if attack == "signflip":
-        s = float(rng.uniform(params.get("min", 3.0), params.get("max", 10.0)))
+        # Signflip is already -s, but let's make it consistently damaging
+        s = float(rng.uniform(params.get("min", 20.0), params.get("max", 50.0)))
         return {k: v * (-s) for k, v in delta_dict.items()}
 
     return delta_dict  # unknown attack — pass through unchanged
@@ -123,8 +126,8 @@ def pick_attack(attack_pool: list, rng: np.random.Generator) -> Optional[str]:
 
 # Default hyperparameters for each attack
 DEFAULT_ATTACK_PARAMS = {
-    "scaling": {"min": 3.0, "max": 10.0},
-    "signflip": {"min": 3.0, "max": 10.0},
+    "scaling": {"min": 20.0, "max": 50.0},
+    "signflip": {"min": 20.0, "max": 50.0},
     "label_flip": {"prob": 1.0},
     "backdoor": {"poison_frac": 0.3, "trigger": "corner_pixel", "trigger_value": 1.0, "target": 0},
 }

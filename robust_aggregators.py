@@ -93,10 +93,16 @@ def krum(
     f : int — assumed number of malicious clients
     weights : ignored (Krum selects, not averages)
     """
+    n = len(deltas)
+    if n <= 3:
+        # Krum is undefined for n <= 3; fall back to FedAvg
+        return fedavg(deltas, weights)
     mat = torch.stack([_state_dict_to_vec(d) for d in deltas])  # (n, d)
-    n = mat.shape[0]
     d2 = _pairwise_dist2(mat)
-    m = max(1, n - f - 2)
+    # Cap f so that m = n - f - 2 is always >= 2 (Krum requires at least 2 neighbours)
+    f_capped = min(f, n - 4)  # worst-case: m = n - (n-4) - 2 = 2
+    f_capped = max(0, f_capped)
+    m = max(2, n - f_capped - 2)
     scores = []
     for i in range(n):
         vals, _ = torch.sort(d2[i])
@@ -122,10 +128,16 @@ def multi_krum(
     m_select : number of updates to select; defaults to n - f
     weights : optional weights for the selected updates
     """
+    n = len(deltas)
+    if n <= 3:
+        # Krum is undefined for n <= 3; fall back to FedAvg
+        return fedavg(deltas, weights)
     mat = torch.stack([_state_dict_to_vec(d) for d in deltas])
-    n = mat.shape[0]
     d2 = _pairwise_dist2(mat)
-    m_neighbour = max(1, n - f - 2)
+    # Cap f so that m_neighbour = n - f - 2 is always >= 2
+    f_capped = min(f, n - 4)
+    f_capped = max(0, f_capped)
+    m_neighbour = max(2, n - f_capped - 2)
     scores = []
     for i in range(n):
         vals, _ = torch.sort(d2[i])
@@ -133,6 +145,7 @@ def multi_krum(
     scores = torch.stack(scores)
     order = torch.argsort(scores)
     m_sel = m_select if m_select is not None else max(1, n - f)
+    m_sel = min(m_sel, n)  # guard: never select more than available
     selected = [int(i.item()) for i in order[:m_sel]]
 
     selected_deltas = [deltas[i] for i in selected]

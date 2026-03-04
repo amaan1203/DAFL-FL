@@ -7,7 +7,8 @@ import numpy as np
 
 # --- FIXED PARAMETERS ---
 # SCALE_FACTOR converts float parameter deltas to integers for SSS.
-SCALE_FACTOR = 10**6
+SCALE_FACTOR = 10**3  # Reduced from 10**6 to prevent prime-field overflow for large model deltas.
+                       # FIELD_SIZE = 2^31-1 ≈ 2.1e9 → max safe |delta| = 2147483 (vs 2147 before).
 
 # FIELD_SIZE is a large prime for the finite field.
 FIELD_SIZE = 2**31 - 1  # 2147483647 — Mersenne prime, safely larger than any scaled delta
