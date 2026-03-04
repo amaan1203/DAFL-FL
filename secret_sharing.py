@@ -69,6 +69,77 @@ def generate_shares(n: int, m: int, secret: int) -> List[Tuple[int, int]]:
     return shares
 
 
+def coeff_vectorized(t: int, secrets_field: np.ndarray) -> np.ndarray:
+    """Generate polynomial coefficients for a batch of secrets.
+    secrets_field: an array of shape (N,) containing secrets encoded in the field.
+    returns: an array of shape (N, t), where the last column is the secret.
+    """
+    N = secrets_field.shape[0]
+    t = int(t)
+    # Generate random coefficients in [0, FIELD_SIZE)
+    coeffs = np.random.randint(0, FIELD_SIZE, size=(N, t - 1), dtype=np.int64)
+    secrets_col = secrets_field.reshape(N, 1).astype(np.int64)
+    return np.hstack((coeffs, secrets_col))
+
+
+def polynom_vectorized(x: int, coeffs: np.ndarray) -> np.ndarray:
+    """Evaluate polynomials for N secrets at point x.
+    coeffs: (N, t) array
+    x: integer point
+    returns: (N,) array of y values
+    """
+    N, t = coeffs.shape
+    # Powers of x: [x^(t-1), x^(t-2), ..., x^0]
+    powers = np.power(x, np.arange(t - 1, -1, -1, dtype=np.int64)) % FIELD_SIZE
+    
+    y = np.zeros(N, dtype=np.int64)
+    for i in range(t):
+        term = (coeffs[:, i] * powers[i]) % FIELD_SIZE
+        y = (y + term) % FIELD_SIZE
+    return y
+
+
+def generate_shares_vectorized(n: int, m: int, secrets: np.ndarray) -> Tuple[List[int], np.ndarray]:
+    """Generate n shares for a batch of secrets with threshold m.
+    
+    Parameters
+    ----------
+    n : int
+        Total number of shares to generate (one for each participant).
+    m : int
+        Threshold.
+    secrets : np.ndarray
+        Array of secrets of shape (N,).
+        
+    Returns
+    -------
+    Tuple[List[int], np.ndarray]
+        List of x_values (len n)
+        Array of y_values of shape (n, N) where each row corresponds to shares for an x_value.
+    """
+    # Encode negative secrets into the field
+    secrets_field = secrets % FIELD_SIZE
+    coeffs = coeff_vectorized(m, secrets_field)
+    
+    x_values = []
+    y_values_list = []
+    
+    used_x_values = set()
+    for _ in range(n):
+        while True:
+            x = np.random.randint(1, FIELD_SIZE)
+            if x not in used_x_values:
+                used_x_values.add(x)
+                break
+        
+        y = polynom_vectorized(x, coeffs)
+        x_values.append(int(x))
+        y_values_list.append(y)
+        
+    # Return x_values and a stacked array of y_values (n, N)
+    return x_values, np.vstack(y_values_list)
+
+
 def mod_inverse(n, modulus):
     """
     Computes the modular multiplicative inverse of n modulo modulus
