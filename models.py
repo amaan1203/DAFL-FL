@@ -134,7 +134,7 @@ def get_resnet18(n_classes):
     :param n_classes:
     :return: nn.Module
     """
-    model = models.resnet18(pretrained=True)
+    model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
     model.fc = nn.Linear(model.fc.in_features, n_classes)
 
     return model
@@ -146,7 +146,7 @@ def get_resnet18_cifar(n_classes):
     :param n_classes:
     :return: nn.Module
     """
-    model = models.resnet18(pretrained=True)
+    model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
     # Replace initial 7x7 conv with 3x3 to preserve spatial resolution of 32x32 images
     model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
     # Remove maxpool to prevent further early spatial shrinkage

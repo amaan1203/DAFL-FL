@@ -55,7 +55,9 @@ def run_test():
     print(f"Original Secret:    {original_secret_float}")
     print(f"Reconstructed Secret: {final_reconstructed_float}")
 
-    if abs(original_secret_float - final_reconstructed_float) < 1e-9:
+    # Tolerance = 1/SCALE_FACTOR: the integer encoding is only precise to this level by design.
+    tolerance = 1.0 / SCALE_FACTOR
+    if abs(original_secret_float - final_reconstructed_float) <= tolerance:
         print("\n✅ SUCCESS: The reconstructed secret matches the original.")
     else:
         print("\n❌ FAILURE: The reconstructed secret DOES NOT match the original.")

@@ -207,7 +207,8 @@ def run_one(args, all_clients_cfg, agg_name, mal_frac):
     num_clients = len(all_clients_cfg)
     threshold = max(2, num_clients // 4)
     n_mal = int(mal_frac * num_clients)
-    num_classes = 10 if args.experiment in ("mnist", "cifar10") else 2
+    # Use CLI-supplied --num_classes (avoids wrong default of 2 for synthetic/cifar100)
+    num_classes = args.num_classes
 
     tag = f"{agg_name}_mal{int(mal_frac*100):02d}"
 
@@ -231,7 +232,9 @@ def run_one(args, all_clients_cfg, agg_name, mal_frac):
     global_logger = SummaryWriter(logs_dir)
 
     attack_params = DEFAULT_ATTACK_PARAMS.copy()
-    assumed_mal = max(1, n_mal)
+    # Use the real malicious count — do NOT inflate to 1 when n_mal=0.
+    # Passing f=0 to Krum means it will score using n-2 neighbours (benign baseline).
+    assumed_mal = n_mal
 
     if agg_name in ("sss", "sss_robust"):
         agg = SecureAggregator(
@@ -418,6 +421,9 @@ def parse_args():
     p.add_argument("--local_steps",  type=int, default=1)
     p.add_argument("--local_optimizer", default="sgd")
     p.add_argument("--objective_type",  default="average")
+    p.add_argument("--num_classes", type=int, default=10,
+                   help="Number of output classes in the task (e.g. 10 for MNIST/CIFAR-10, "
+                        "100 for CIFAR-100, 2 for synthetic binary). Used by label_flip attack.")
     p.add_argument("--results_file", default=None,
                    help="CSV to save sweep results. Defaults to <logs_dir>/sweep_results.csv")
     return p.parse_args()
