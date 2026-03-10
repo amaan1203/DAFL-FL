@@ -43,7 +43,8 @@ python data/main.py \
   --dataset_name cifar100 \
   --n_tasks 20 \
   --save_dir data/cifar100_fed \
-  --seed 42
+  --seed 42 \
+  --incongruent_split \
 ```
 
 ## Output
