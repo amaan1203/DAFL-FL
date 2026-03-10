@@ -44,7 +44,7 @@ python data/main.py \
   --n_tasks 20 \
   --save_dir data/cifar100_fed \
   --seed 42 \
-  --incongruent_split \
+  --incongruent_split 
 ```
 
 ## Output
