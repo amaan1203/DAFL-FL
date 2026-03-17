@@ -2,6 +2,7 @@
 .idea/
 data/mnist/raw_data/
 data/cifar10/raw_data/
+data/cifar100_fed/raw_data/cifar-100-python/train
 
 # Don't track files with these extensioons
 *.ipynb
@@ -14,6 +15,8 @@ data/cifar10/raw_data/
 *.pdf
 *.tfevents.*
 *.log
+*.tar.gz
+
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
