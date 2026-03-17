@@ -27,13 +27,16 @@ class SecureClient:
             val_loader=None,
             test_loader=None,
             num_clients=20,
-            threshold=5):
+            threshold=5,
+            packing_l=1):
 
         self.client_id = client_id
         self.trainer = trainer
         self.device = self.trainer.device
         self.num_clients = num_clients
         self.threshold = threshold
+        # Expose the packing parameter l. Defaults to 1 (Standard SSS) unless overridden.
+        self.packing_l = packing_l
         self.previous_global_params = None
 
         # received_shares: { owner_client_id -> { param_name -> [{'pos': pos, 'share': (x,y)}, ...] } }
@@ -188,22 +191,30 @@ class SecureClient:
                 deltas[name] = param.data.clone()
         return deltas
 
-    def create_parameter_shares(self, participating_clients_ids: list) -> dict:
+    def create_parameter_shares(self, participating_clients_ids: list, attack: str = None, attack_params: dict = None, rng = None) -> dict:
         """Generate one unique SSS share per participant for each parameter delta using vectorization.
 
         Parameters
         ----------
         participating_clients_ids : list[int]
             IDs of all clients participating in this round (including self).
+        attack : str, optional
+            Update-time attack to apply to deltas (e.g. 'scaling', 'signflip').
+        attack_params : dict, optional
+            Params for the attack.
+        rng : np.random.Generator, optional
 
         Returns
         -------
         dict
-            { recipient_client_id -> { param_name -> [{'pos': pos, 'share': (x,y)}, ...] } }
+            { recipient_client_id -> { param_name -> { 'y': np.ndarray, 'x': int, 'metadata': dict } } }
         """
-        from secret_sharing import generate_shares_vectorized
+        from secret_sharing import generate_packed_shares_vectorized
+        from attacks import apply_update_attack
 
         deltas = self.get_parameter_deltas()
+        if attack in ("scaling", "signflip"):
+            deltas = apply_update_attack(deltas, attack, attack_params, rng)
 
         if not deltas:
             print(f"[Client {self.client_id}] WARNING: parameter deltas are empty.")
@@ -211,46 +222,49 @@ class SecureClient:
         n_participants = len(participating_clients_ids)
         participant_map = {i: cid for i, cid in enumerate(participating_clients_ids)}
 
+        # New structure: { recipient_id -> { param_name -> { 'y': np.ndarray, 'x': int, 'metadata': dict } } }
         shares_for_clients = {cid: {} for cid in participating_clients_ids}
 
         for param_name, delta_tensor in deltas.items():
-            shares_for_clients_param = {cid: [] for cid in participating_clients_ids}
-
-            # Flatten the tensor to vectorise over all elements at once
+            # Flatten the tensor to pack and vectorise over blocks
             shape = delta_tensor.shape
-            delta_flat = delta_tensor.flatten().numpy()
+            delta_flat = delta_tensor.flatten().detach().cpu().numpy()
+
+            # Pad array so its length is a multiple of self.packing_l
+            total_params = len(delta_flat)
+            pad_len = (self.packing_l - (total_params % self.packing_l)) % self.packing_l
+            if pad_len > 0:
+                delta_flat = np.concatenate([delta_flat, np.zeros(pad_len)])
+                
+            n_blocks = len(delta_flat) // self.packing_l
 
             # Convert to integers by scaling safely
             secrets_arr = np.round(delta_flat * SCALE_FACTOR).astype(np.int64)
+            secrets_batch = secrets_arr.reshape(n_blocks, self.packing_l)
 
-            # Generate shares for the entire tensor in one C++ vectorized call
+            # Generate shares for the entire tensor in one PSSS vectorized call
             # x_values is a list of len `n_participants`
-            # y_values_matrix is (n_participants, N)
-            x_values, y_values_matrix = generate_shares_vectorized(n_participants, self.threshold, secrets_arr)
+            # y_values_matrix is (n_participants, n_blocks)
+            x_values, y_values_matrix = generate_packed_shares_vectorized(
+                n=n_participants, t=self.threshold, l=self.packing_l, secrets=secrets_batch
+            )
 
-            # Map the flat indices back to their multi-dimensional coordinates
-            # This is necessary because the aggregator's buffer reconstructs param-by-param
-            all_positions = list(np.ndindex(shape))
-
+            # Store as contiguous numpy arrays per participant
             for i in range(n_participants):
                 recipient_id = participant_map[i]
-                x_val = x_values[i]
-                y_vals = y_values_matrix[i]
-                
-                # Bundle the pos with its (x, y) share
-                shares_list = [
-                    {'pos': pos, 'share': (x_val, int(y))}
-                    for pos, y in zip(all_positions, y_vals)
-                ]
-                
-                shares_for_clients_param[recipient_id] = shares_list
-
-            for cid in participating_clients_ids:
-                shares_for_clients[cid][param_name] = shares_for_clients_param[cid]
+                shares_for_clients[recipient_id][param_name] = {
+                    'y': y_values_matrix[i].astype(np.int64), # (n_blocks,) array
+                    'x': int(x_values[i]),
+                    'metadata': {
+                        'shape': shape,
+                        'pad_len': pad_len,
+                        'n_blocks': n_blocks
+                    }
+                }
 
         return shares_for_clients
 
-    def distribute_shares(self, participating_clients_dict: dict):
+    def distribute_shares(self, participating_clients_dict: dict, attack: str = None, attack_params: dict = None, rng = None):
         """Generate shares and deliver them to every participating client.
 
         Self receives its own share directly (stored in received_shares).
@@ -262,7 +276,7 @@ class SecureClient:
             All clients participating in this round, keyed by client_id.
         """
         participating_clients_ids = list(participating_clients_dict.keys())
-        all_shares = self.create_parameter_shares(participating_clients_ids)
+        all_shares = self.create_parameter_shares(participating_clients_ids, attack, attack_params, rng)
 
         print(f"[Client {self.client_id}] Distributing shares to {len(participating_clients_ids)} clients...")
         for recipient_id, param_shares in all_shares.items():
@@ -281,7 +295,7 @@ class SecureClient:
             The client_id of the client who generated these shares
             (i.e., the owner of the secret parameters being shared).
         param_shares : dict
-            { param_name -> [{'pos': pos, 'share': (x,y)}, ...] }
+            { param_name -> { 'y': np.ndarray, 'x': int, 'metadata': dict } }
         """
         # sender_id IS the owner: Client A distributes shares of *its own* params,
         # so the shares stored here are keyed by A's id.
@@ -293,7 +307,7 @@ class SecureClient:
         Returns
         -------
         dict
-            { owner_client_id -> { param_name -> [{'pos': pos, 'share': (x,y)}, ...] } }
+            { owner_client_id -> { param_name -> { 'y': np.ndarray, 'x': int, 'metadata': dict } } }
         """
         return dict(self.received_shares)
 

@@ -193,6 +193,14 @@ def parse_args(args_list=None):
         default=5
     )
 
+    parser.add_argument(
+        '--packing_l',
+        help='Packing factor l for Packed Shamir Secret Sharing; '
+             'default is 1 (standard SSS).',
+        type=int,
+        default=1
+    )
+
 
     if args_list:
         args = parser.parse_args(args_list)

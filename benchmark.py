@@ -39,12 +39,13 @@ from attacks import DEFAULT_ATTACK_PARAMS, apply_update_attack, pick_attack
 from utils.torch_utils import copy_model
 
 
-ATTACKS = ["scaling", "signflip", "label_flip"]
-AGGREGATORS = ["sss", "fedavg", "krum", "multi_krum", "trimmed_mean"]
-MALICIOUS_FRACS = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+DEFAULT_ATTACKS = ["scaling", "signflip", "label_flip"]
+DEFAULT_AGGREGATORS = ["psss", "fedavg", "krum", "multi_krum", "trimmed_mean"]
+DEFAULT_MALICIOUS_FRACS = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
 
 COLORS = {
     "sss":          "#6C63FF",
+    "psss":         "#A855F7",
     "fedavg":       "#43AA8B",
     "krum":         "#F9844A",
     "multi_krum":   "#277DA1",
@@ -184,7 +185,7 @@ def _cleanup_scenario(clients_dict, global_logger):
 def run_scenario(args, all_clients_cfg, agg_name, attack, mal_frac):
     label = f"{agg_name}_{attack}_{int(mal_frac*100)}"
     num_clients = len(all_clients_cfg)
-    threshold = max(2, num_clients // 4)
+    threshold = args.threshold if getattr(args, 'threshold', None) is not None else max(2, num_clients // 2)
     n_mal = int(mal_frac * num_clients)
 
     rng = np.random.default_rng(args.seed)
@@ -207,9 +208,17 @@ def run_scenario(args, all_clients_cfg, agg_name, attack, mal_frac):
     os.makedirs(global_logs_dir, exist_ok=True)
     global_logger = SummaryWriter(global_logs_dir)
 
-    num_classes = args.num_classes if args.num_classes is not None else (10 if args.experiment in ("mnist", "cifar10") else 2)
+    num_classes = args.num_classes if args.num_classes is not None else (
+        10 if args.experiment in ("mnist", "fmnist", "cifar10", "cifar10_dbn", "cifar10_resnet9") else
+        100 if args.experiment == "cifar100" else 2
+    )
 
-    if agg_name == "sss":
+    if agg_name in ("sss", "psss"):
+        # sss = standard SSS (packing_l=1), psss = Packed SSS (packing_l=args.packing_l, default 5)
+        effective_l = args.packing_l if agg_name == "psss" else 1
+        # Patch packing_l on all clients so SecureAggregator reads the right value
+        for client in clients_dict.values():
+            client.packing_l = effective_l
         aggregator = SecureAggregator(
             clients_dict=clients_dict,
             clients_weights_dict=clients_weights_dict,
@@ -223,6 +232,9 @@ def run_scenario(args, all_clients_cfg, agg_name, attack, mal_frac):
             attack_params=DEFAULT_ATTACK_PARAMS.copy(),
             assumed_malicious=n_mal,
             num_classes=num_classes,
+            use_robust_detection=getattr(args, 'robust_agg', False),
+            n_trials=args.n_trials,
+            min_consensus_fraction=args.min_consensus_fraction,
         )
     else:
         aggregator = RobustCentralizedAggregator(
@@ -239,6 +251,11 @@ def run_scenario(args, all_clients_cfg, agg_name, attack, mal_frac):
         )
 
     activity_rng = np.random.default_rng(args.seed)
+    if getattr(args, 'full_participation', False):
+        for cid in all_clients_cfg:
+            all_clients_cfg[cid]["availability"] = 1.0
+            all_clients_cfg[cid]["stability"] = 1.0
+
     activity_sim = get_activity_simulator(all_clients_cfg, activity_rng)
     estimator_rng = np.random.default_rng(args.seed)
     activity_est = get_activity_estimator("oracle", all_clients_cfg, estimator_rng)
@@ -252,19 +269,29 @@ def run_scenario(args, all_clients_cfg, agg_name, attack, mal_frac):
         smoothness_param=0.0,
         tolerance=0.0,
         time_horizon=args.n_rounds,
-        fast_n_clients_per_round=10,
+        fast_n_clients_per_round=num_clients,
         adafed_full_participation=False,
         bias_const=1.0,
         rng=sampler_rng,
     )
+
+    # Round-by-round logging
+    rounds_log_path = os.path.join(args.logs_dir, f"rounds_{args.experiment}_{attack}_{agg_name}_{int(mal_frac*100)}.csv")
+    with open(rounds_log_path, "w") as f_log:
+        f_log.write("round,accuracy\n")
 
     for rnd in range(args.n_rounds):
         active = clients_sampler.get_active_clients()
         sampled_ids, sampled_wts = clients_sampler.sample(active_clients=active, loss_dict=None)
         try:
             aggregator.mix(sampled_ids, sampled_wts)
+            # Evaluate after each round
+            current_acc = _evaluate_global(aggregator)
+            with open(rounds_log_path, "a") as f_log:
+                f_log.write(f"{rnd},{current_acc}\n")
+            print(f"  [Round {rnd}] Accuracy: {current_acc:.4f}")
         except Exception as e:
-            print(f"Aggregator {agg_name} encountered an error: {e}")
+            print(f"Aggregator {agg_name} encountered an error at round {rnd}: {e}")
             _cleanup_scenario(clients_dict, global_logger)
             return 0.0
 
@@ -324,6 +351,15 @@ def parse_args():
     p.add_argument("--objective_type",  default="average")
     p.add_argument("--num_classes", type=int, default=None)
     p.add_argument("--results_file", default=None)
+    p.add_argument("--threshold", type=int, default=None)
+    p.add_argument("--packing_l", type=int, default=1)
+    p.add_argument("--attacks", nargs="+", default=DEFAULT_ATTACKS)
+    p.add_argument("--aggregators", nargs="+", default=DEFAULT_AGGREGATORS)
+    p.add_argument("--mal_fracs", type=float, nargs="+", default=DEFAULT_MALICIOUS_FRACS)
+    p.add_argument("--robust_agg", action="store_true", help="Enable outlier-detection in SecureAggregator")
+    p.add_argument("--n_trials", type=int, default=100, help="Number of trials for robust consensus")
+    p.add_argument("--min_consensus_fraction", type=float, default=0.5, help="Minimum fraction of trials that must agree for consensus")
+    p.add_argument("--full_participation", action="store_true", help="Force all clients to be available every round")
     return p.parse_args()
 
 
@@ -347,13 +383,18 @@ if __name__ == "__main__":
     csv_file = args.results_file if args.results_file else os.path.join(args.logs_dir, f"results_{args.experiment}.csv")
     
     all_results = []
-    total = len(ATTACKS) * len(MALICIOUS_FRACS) * len(AGGREGATORS)
+    total = len(args.attacks) * len(args.mal_fracs) * len(args.aggregators)
     done = 0
+    
+    # Save the selected lists for plotting correctly
+    ATTACKS = args.attacks
+    MALICIOUS_FRACS = args.mal_fracs
+    AGGREGATORS = args.aggregators
 
     print(f"\n--- Starting Benchmark: {args.experiment} ---")
-    for attack in ATTACKS:
-        for mal_frac in MALICIOUS_FRACS:
-            for agg_name in AGGREGATORS:
+    for attack in args.attacks:
+        for mal_frac in args.mal_fracs:
+            for agg_name in args.aggregators:
                 done += 1
                 n_mal = int(mal_frac * len(all_clients_cfg))
                 print(f"[{done:>3}/{total}] Attack: {attack:10s} | Frac: {mal_frac:.1f} ({n_mal}) | Agg: {agg_name}")
@@ -367,9 +408,11 @@ if __name__ == "__main__":
                     "final_acc": acc
                 })
 
-    with open(csv_file, "w", newline="") as f:
+    file_exists = os.path.isfile(csv_file)
+    with open(csv_file, "a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=all_results[0].keys())
-        writer.writeheader()
+        if not file_exists:
+            writer.writeheader()
         writer.writerows(all_results)
     
     print(f"[Benchmark] Results saved to {csv_file}")

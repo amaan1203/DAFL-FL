@@ -33,8 +33,7 @@ import warnings
 
 def experiment_not_implemented_message(experiment_name):
     error = f"{experiment_name} is not available! " \
-            f"Possible are: 'cifar10', 'cifar100', 'mnist', 'synthetic_clustered' and 'synthetic_leaf'."
-
+            f"Possible are: 'cifar10', 'cifar10_dbn', 'cifar100', 'mnist', 'fmnist', 'synthetic_clustered' and 'synthetic_leaf'."
     return error
 
 
@@ -62,10 +61,14 @@ def get_model(experiment_name, device):
         model = LinearLayer(input_dim=10, output_dim=1, bias=True)
     elif experiment_name == "mnist":
         model = LinearLayer(input_dim=784, output_dim=10, bias=True)
+    elif experiment_name == "fmnist":
+        model = FemnistCNN(num_classes=10)  # small 2-conv CNN, ~250K params, 28x28 greyscale
     elif experiment_name == "emnist" or experiment_name == "femnist":
         model = FemnistCNN(num_classes=62)
     elif experiment_name == "cifar10":
         model = CIFAR10CNN(num_classes=10)
+    elif experiment_name == "cifar10_dbn":
+        model = get_cifar10_dbn(n_classes=10)  # DeepBatchNorm, ~330K params
         # TODO: choose model
         # model = get_mobilenet(n_classes=10)
     elif experiment_name == "cifar100":
@@ -124,11 +127,16 @@ def get_trainer(experiment_name, device, optimizer_name, lr, seed):
         criterion = nn.BCEWithLogitsLoss(reduction='mean').to(device)
         metric = binary_accuracy
         is_binary_classification = True
-    elif experiment_name == "cifar10" or experiment_name == "cifar100":
+    elif experiment_name in ("cifar10", "cifar100"):
         criterion = nn.CrossEntropyLoss(reduction="mean").to(device)
         metric = accuracy
         is_binary_classification = False
-    elif experiment_name == "mnist" or experiment_name == "emnist" or experiment_name == "femnist":
+    elif experiment_name == "cifar10_dbn":
+        # ConvBnNet2 applies log_softmax internally → must use NLLLoss
+        criterion = nn.NLLLoss(reduction="mean").to(device)
+        metric = accuracy
+        is_binary_classification = False
+    elif experiment_name in ("mnist", "emnist", "femnist", "fmnist"):
         criterion = nn.CrossEntropyLoss(reduction="mean").to(device)
         metric = accuracy
         is_binary_classification = False
@@ -201,9 +209,29 @@ def get_loader(experiment_name, client_data_path, batch_size, train):
         else:
             # Fallback: download via TorchVision (whole-dataset, non-federated)
             transform = Compose([ToTensor(), Normalize((0.1307,), (0.3081,))])
-            dataset = TorchVisionMNIST(root=client_data_path, train=train, transform=transform, download=True)
+            # FIX: Use a global root to prevent 20 clients downloading to 20 folders
+            dataset = TorchVisionMNIST(root="data/mnist", train=train, transform=transform, download=True)
 
-    elif experiment_name == "cifar10":
+    elif experiment_name == "fmnist":
+        from torchvision.datasets import FashionMNIST as TorchFMNIST
+        npy_train = os.path.join(client_data_path, "train_data.npy")
+        if os.path.isfile(npy_train):
+            if train:
+                data    = np.load(os.path.join(client_data_path, "train_data.npy"))
+                targets = np.load(os.path.join(client_data_path, "train_targets.npy"))
+            else:
+                data    = np.load(os.path.join(client_data_path, "test_data.npy"))
+                targets = np.load(os.path.join(client_data_path, "test_targets.npy"))
+            data = data.reshape(len(data), 1, 28, 28).astype(np.float32) / 255.0
+            # FashionMNIST normalization
+            data = (data - 0.2860) / 0.3530
+            dataset = Tabular(data=data, targets=targets.astype(np.int64))
+        else:
+            transform = Compose([ToTensor(), Normalize((0.2860,), (0.3530,))])
+            # FIX: Use a global root to prevent redundant downloads
+            dataset = TorchFMNIST(root="data/fmnist", train=train, transform=transform, download=True)
+
+    elif experiment_name in ("cifar10", "cifar10_dbn"):
         transform = Compose([
             ToTensor(),
             Normalize(
@@ -308,6 +336,7 @@ def init_client(args, client_id, data_dir, logger, num_clients=None, threshold=5
         logger=logger,
         num_clients=num_clients if num_clients is not None else threshold,
         threshold=threshold,
+        packing_l=getattr(args, 'packing_l', 1)
     )
 
     return client

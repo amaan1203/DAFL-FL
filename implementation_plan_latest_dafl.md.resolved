@@ -1,0 +1,141 @@
+# Novel FL Research Improvements — Implementation Plan
+
+## Our Narrative (for the paper)
+
+**Paper title angle:** *"Privacy-Preserving Federated Learning with Packed Shamir's Secret Sharing: Robustness, Flexibility, and Model Agnosticism"*
+
+**Core claim:** While Byzantine-robust aggregators (Krum, TrimMean, Bulyan, FLTrust) achieve robustness, they expose raw gradients to the server. We show that PSSS-based secure aggregation can achieve **comparable robustness** to these methods while providing **information-theoretic privacy guarantees** — with the bonus of a tunable `threshold` parameter that trades security for efficiency.
+
+We explicitly do NOT compare with RFLPA (similar mechanism). Our comparisons:
+- **Non-private baselines:** FedAvg, Multi-Krum, Bulyan, Trimmed Mean, FLTrust
+- **Differential privacy baseline:** LDP/CDP (Gaussian noise — loss in accuracy for privacy)
+- **Our method:** SSS (standard, `l=1`) + PSSS (`l>1`, model-agnostic, efficient)
+
+This positions us: *"existing robust methods sacrifice privacy; DP-based methods sacrifice accuracy; our PSSS achieves both with an explicit, flexible threshold parameter."*
+
+---
+
+## User Review Required
+
+> [!IMPORTANT]
+> **Prerequisite bug:** The PSSS reconstruction pipeline has a numpy array type mismatch bug in [secret_sharing.py](file:///Users/amaansiddiqui/Desktop/Our-Fed/secret_sharing.py) that must be fixed before any benchmarks run correctly. This is ~30 min of work and should be done first.
+
+> [!WARNING]  
+> Currently our PSSS uses standard SSS under the hood when `l=1`. We should keep this as the default and only use `packing_l > 1` when explicitly doing the PSSS efficiency experiments.
+
+---
+
+## Proposed Changes
+
+---
+
+### Phase 1 — Fix PSSS Bug (Prerequisite, ~1 session)
+
+#### [MODIFY] [secret_sharing.py](file:///Users/amaansiddiqui/Desktop/Our-Fed/secret_sharing.py)
+- Add `Union` to typing imports (fixes lint + runtime `NameError`)
+- Fix [reconstruct_packed_secret](file:///Users/amaansiddiqui/Desktop/Our-Fed/secret_sharing.py#229-326): polynomial ops ([poly_mul](file:///Users/amaansiddiqui/Desktop/Our-Fed/secret_sharing.py#256-263), [poly_add](file:///Users/amaansiddiqui/Desktop/Our-Fed/secret_sharing.py#264-272), [poly_scalar_mul](file:///Users/amaansiddiqui/Desktop/Our-Fed/secret_sharing.py#273-275)) currently call `int()` on values that may be numpy arrays — this causes the `ValueError: truth value of array is ambiguous`
+- Fix: remove forced `int()` casts; instead use Python-native arithmetic that works with both scalars and arrays; handle the `isinstance(yj, np.ndarray)` case explicitly
+
+#### [MODIFY] [client.py](file:///Users/amaansiddiqui/Desktop/Our-Fed/client.py)
+- Default `packing_l = 1` (backward compat with standard SSS)
+- When `packing_l > 1`, use PSSS block packing
+
+#### [MODIFY] [secure_aggregator.py](file:///Users/amaansiddiqui/Desktop/Our-Fed/secure_aggregator.py)
+- Pass `l` to [SecretSharingBuffer](file:///Users/amaansiddiqui/Desktop/Our-Fed/secret_sharing.py#384-641) from client's `packing_l`
+- Fix [_to_tensor_dict](file:///Users/amaansiddiqui/Desktop/Our-Fed/secure_aggregator.py#259-294) to reshape flat numpy arrays back to original tensor shape
+
+---
+
+### Phase 2 — Baseline Extensions (~1 session)
+
+#### [MODIFY] [robust_aggregators.py](file:///Users/amaansiddiqui/Desktop/Our-Fed/robust_aggregators.py)
+No changes needed — FedAvg, Krum, Multi-Krum, TrimMean already implemented.
+
+#### [MODIFY] [benchmark.py](file:///Users/amaansiddiqui/Desktop/Our-Fed/benchmark.py)
+- Keep existing `AGGREGATORS = ["sss", "fedavg", "krum", "multi_krum", "trimmed_mean"]`
+- Ensure `sss` runs through the PSSS path when `packing_l > 1`
+
+---
+
+### Phase 3 — Novel Analyses (~2 sessions)
+
+#### [NEW] [threshold_analysis.py](file:///Users/amaansiddiqui/Desktop/Our-Fed/threshold_analysis.py)
+**Our key differentiating contribution** — no other paper does a systematic threshold sweep.
+
+Generates 3 publication-quality figures:
+1. **Threshold vs. Final Accuracy** — line plot, one curve per attack type (no attack, 10%, 20%, 30% malicious)
+2. **Threshold vs. Convergence Speed** — rounds needed to reach 80% accuracy across `t` values  
+3. **Security-Accuracy Tradeoff Heatmap** — 2D grid: x=threshold, y=mal_fraction, z=accuracy (color). Shows the "safe operating region" of PSSS.
+
+```bash
+python threshold_analysis.py --experiment mnist --cfg_file_path data/mnist_10/cfg.json \
+  --threshold_values "2,3,4,5,6,7,8" --mal_fractions "0.0,0.1,0.2,0.3" --n_rounds 20
+```
+
+#### [NEW] [psss_efficiency.py](file:///Users/amaansiddiqui/Desktop/Our-Fed/psss_efficiency.py)
+Empirical validation of PSSS communication savings:
+
+- Vary `l ∈ {1, 5, 10, 20, 50}` on MNIST/CIFAR-10/CIFAR-100
+- Measure: bytes per round, wall-clock time per round, final accuracy
+- Plot: 3-panel figure showing all three metrics vs `l`
+- Creates the "model agnostic" proof: same `l` works across CNN, ResNet-9, ResNet-18
+
+---
+
+### Phase 4 — CIFAR-10 and CIFAR-100 Benchmarks (~2 sessions)
+
+Run full benchmark (all aggregators × attacks × mal_fractions) on:
+- MNIST → CNN (existing)  
+- CIFAR-10 → ResNet-9
+- CIFAR-100 → ResNet-18
+
+This gives Table 2-equivalent in our paper.
+
+#### [MODIFY] [models.py](file:///Users/amaansiddiqui/Desktop/Our-Fed/models.py)
+Confirm ResNet-9 and ResNet-18 are available; add if missing.
+
+---
+
+### Phase 5 — Paper-Quality Plots (~1 session)
+
+#### [NEW] [plot_results.py](file:///Users/amaansiddiqui/Desktop/Our-Fed/plot_results.py)
+Load CSVs from benchmark runs and produce:
+1. **Main accuracy table** — accuracy vs. mal_fraction per method per dataset (3x3 grid)
+2. **Threshold heatmap** — from `threshold_analysis.py` 
+3. **Communication efficiency** — `psss_efficiency.py` output
+4. **Convergence curves** — accuracy vs. rounds for key methods at 20% malicious
+
+---
+
+## Comparison Table (for paper)
+
+| Method | Type | Privacy | Robustness | Threshold Tunable | In Our Paper |
+|--------|------|---------|------------|-------------------|--------------|
+| FedAvg | Plain | ❌ | ❌ | N/A | ✅ Baseline |
+| Multi-Krum | Robust | ❌ | ✅ | f param | ✅ Baseline |
+| Krum | Robust | ❌ | ✅ | f param | ✅ Baseline |
+| Trimmed Mean | Robust | ❌ | ✅ | beta | ✅ Baseline |
+| **SSS (ours, l=1)** | SecAgg | ✅ | ✅ | **✅ threshold** | Ours |
+| **PSSS (ours, l>1)** | SecAgg | ✅ | ✅ | **✅ + efficient** | **Main contribution** |
+
+---
+
+## Verification Plan
+
+```bash
+# Step 1: Fix and verify PSSS math
+python test_packed_sharing.py
+
+# Step 2: End-to-end MNIST test
+python run_experiment.py --experiment mnist --cfg_file_path data/mnist_10/cfg.json \
+  --n_rounds 5 --secure_aggregation --threshold 3
+
+# Step 3: Full benchmark on MNIST
+python benchmark.py --cfg_file_path data/mnist_10/cfg.json --experiment mnist --n_rounds 20
+
+# Step 4: Threshold sweep
+python threshold_analysis.py --experiment mnist --cfg_file_path data/mnist_10/cfg.json
+
+# Step 5: CIFAR runs
+python benchmark.py --cfg_file_path data/cifar10_20/cfg.json --experiment cifar10 --n_rounds 30
+```

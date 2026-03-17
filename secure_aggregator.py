@@ -1,6 +1,7 @@
 import torch
+import numpy as np
 from aggregator import CentralizedAggregator
-from secret_sharing import SecretSharingBuffer
+from secret_sharing import SecretSharingBuffer, SCALE_FACTOR
 from utils.torch_utils import copy_model
 from collections import defaultdict
 
@@ -64,10 +65,14 @@ class SecureAggregator(CentralizedAggregator):
             self.c_round += 1
             return
 
-        if len(sampled_clients_ids) < self.threshold:
+        # Get packing factor from first client to determine true share requirement
+        self.packing_l = getattr(self.clients_dict[sampled_clients_ids[0]], 'packing_l', 1) if sampled_clients_ids else 1
+        shares_needed = self.threshold + self.packing_l - 1
+
+        if len(sampled_clients_ids) < shares_needed:
             print(
                 f"[SecureAgg] Round {self.c_round}: only {len(sampled_clients_ids)} clients sampled "
-                f"but threshold={self.threshold}. Skipping round."
+                f"but shares_needed={shares_needed} (threshold={self.threshold}, l={self.packing_l}). Skipping round."
             )
             self.c_round += 1
             return
@@ -133,14 +138,16 @@ class SecureAggregator(CentralizedAggregator):
             cid: self.clients_dict[cid] for cid in sampled_clients_ids
         }
         for client_id in sampled_clients_ids:
-            self.clients_dict[client_id].distribute_shares(sampled_clients_dict)
+            attack = client_update_attacks.get(client_id)
+            params = self.attack_params.get(attack, DEFAULT_ATTACK_PARAMS.get(attack, {})) if attack else {}
+            self.clients_dict[client_id].distribute_shares(sampled_clients_dict, attack, params, self._rng)
 
         # ----------------------------------------------------------
         # Step 5: Create per-client buffers
         # ----------------------------------------------------------
         print("[Step 5] Creating buffers...")
         buffers_dict = {
-            client_id: SecretSharingBuffer(client_id, self.threshold)
+            client_id: SecretSharingBuffer(client_id, self.threshold, l=self.packing_l)
             for client_id in sampled_clients_ids
         }
 
@@ -159,15 +166,24 @@ class SecureAggregator(CentralizedAggregator):
                 print(f"  [WARNING] Client {uploader_id} has no shares — distribution may have failed.")
                 continue
 
-            print(f"  Client {uploader_id} uploads shares for {len(shares_held)} owner(s).")
             for owner_id, param_shares in shares_held.items():
                 if owner_id not in buffers_dict:
                     continue  # owner not in this round — discard
                 if not param_shares:
-                    print(f"    [WARNING] Empty share set from {uploader_id} for owner {owner_id}.")
                     continue
-                buffers_dict[owner_id].add_shares(uploader_id, param_shares)
-                print(f"    → Buffer[{owner_id}] received shares from uploader {uploader_id}.")
+                if uploader_id in self.malicious_ids:
+                    # [BYZANTINE UPLOADER] Corrupt shares for others
+                    import numpy as _np
+                    corrupted_param_shares = {}
+                    for p_name, p_data in param_shares.items():
+                        corrupted_param_shares[p_name] = {
+                            'y': _np.random.randint(0, 2**31 - 1, size=p_data['y'].shape, dtype=_np.int64),
+                            'x': p_data['x'],
+                            'metadata': p_data['metadata']
+                        }
+                    buffers_dict[owner_id].add_shares(uploader_id, corrupted_param_shares)
+                else:
+                    buffers_dict[owner_id].add_shares(uploader_id, param_shares)
 
         # ----------------------------------------------------------
         # Step 7: Reconstruction
@@ -256,14 +272,54 @@ class SecureAggregator(CentralizedAggregator):
         return reconstructed_deltas
 
     def _to_tensor_dict(self, reconstructed_params: dict, owner_id: int) -> dict:
-        """Convert { param_name -> { pos -> float } } to { param_name -> torch.Tensor }."""
+        """Convert reconstructed parameters to { param_name -> torch.Tensor }.
+
+        Now handles the case where parameters are already reconstructed into tensors.
+        """
+        # If the values are already tensors, just return the dict
+        first_val = next(iter(reconstructed_params.values())) if reconstructed_params else None
+        if isinstance(first_val, torch.Tensor):
+            return reconstructed_params
+        
+        # Fallback for old dictionary-based format if any
         tensor_dict = {}
+        packing_l = getattr(self, 'packing_l', 1)
 
         for param_name, pos_values in reconstructed_params.items():
             shape = self._get_param_shape(param_name)
             tensor = torch.zeros(shape)
-            for pos, value in pos_values.items():
-                tensor[pos] = value
+
+            if packing_l > 1:
+                # PSSS mode: pos keys are integer block indices, values are float arrays of length l
+                sorted_blocks = sorted(
+                    [(k, v) for k, v in pos_values.items() if isinstance(k, int)],
+                    key=lambda x: x[0]
+                )
+                if sorted_blocks:
+                    flat_parts = [np.atleast_1d(np.asarray(v, dtype=np.float32)) for _, v in sorted_blocks]
+                    flat_array = np.concatenate(flat_parts)  # length = n_blocks * l (may include padding)
+                    numel = tensor.numel()
+                    if len(flat_array) > numel:
+                        flat_array = flat_array[:numel]  # trim padding
+                    if len(flat_array) == numel:
+                        tensor = torch.tensor(flat_array, dtype=torch.float32).view(shape)
+                    else:
+                        print(f"  [ERROR] PSSS shape mismatch for {param_name}: "
+                              f"numel={numel}, reconstructed={len(flat_array)}")
+            else:
+                # Standard SSS mode: pos is a flat integer index, value is a scalar float.
+                # We need to map the flat index back to the tensor's multi-dimensional shape.
+                for pos, value in pos_values.items():
+                    try:
+                        if isinstance(pos, int) and len(shape) > 0:
+                            multi_idx = tuple(np.unravel_index(pos, shape))
+                            tensor[multi_idx] = float(value)
+                        else:
+                            # Fallback if pos is already a tuple or tensor is 0D/1D
+                            tensor[pos] = float(value)
+                    except Exception as e:
+                        print(f"  [ERROR] SSS assign {param_name}[{pos}]={value}: {e}")
+
             tensor_dict[param_name] = tensor
 
         return tensor_dict
@@ -281,50 +337,53 @@ class SecureAggregator(CentralizedAggregator):
     # ------------------------------------------------------------------
 
     def _apply_reconstructed_deltas(self, reconstructed_deltas, weights_tensor, client_ids):
-        """Add weighted-average deltas to the global model.
+        """Add aggregated deltas to the global model.
 
         Parameters
         ----------
         reconstructed_deltas : dict
             { client_id -> { param_name -> torch.Tensor (delta) } }
         weights_tensor : torch.Tensor
-            Unnormalized client weights (same order as client_ids).
+            Unnormalized client weights.
         client_ids : list[int]
         """
-        # Collect all parameter names
-        all_param_names = set()
-        for deltas in reconstructed_deltas.values():
-            all_param_names.update(deltas.keys())
+        if not reconstructed_deltas:
+            return
 
-        averaged_deltas = {}
+        # Prepare list of delta-dicts for the robust aggregator
+        delta_list = []
+        weight_list = []
+        for i, cid in enumerate(client_ids):
+            if cid in reconstructed_deltas:
+                delta_list.append(reconstructed_deltas[cid])
+                weight_list.append(weights_tensor[i].item())
 
-        for param_name in all_param_names:
-            weighted_sum = None
-            weight_sum = 0.0
+        if not delta_list:
+            return
 
-            for i, client_id in enumerate(client_ids):
-                if client_id not in reconstructed_deltas:
-                    continue
-                if param_name not in reconstructed_deltas[client_id]:
-                    continue
+        from robust_aggregators import aggregate
+        # If robust_agg is on, use Trimmed Mean by default on the reconstructed deltas
+        # to ensure the "Brick Wall" robustness until the SSS threshold fails.
+        agg_name = "trimmed_mean" if self.use_robust_detection else "fedavg"
+        
+        # Trim factor beta: we know assumed_malicious, so let's set it appropriately
+        # If n=20 and n_mal=2, beta = 2/20 = 0.1
+        n = len(delta_list)
+        beta = min(0.4, (self.assumed_malicious + 1) / n) if n > 0 else 0.1
 
-                delta = reconstructed_deltas[client_id][param_name]
-                w = weights_tensor[i].item()
-
-                if weighted_sum is None:
-                    weighted_sum = w * delta
-                else:
-                    weighted_sum = weighted_sum + w * delta
-                weight_sum += w
-
-            if weighted_sum is not None and weight_sum > 0:
-                averaged_deltas[param_name] = weighted_sum / weight_sum  # normalize
+        aggregated_delta = aggregate(
+            agg_name=agg_name,
+            deltas=delta_list,
+            weights=weight_list,
+            f=self.assumed_malicious,
+            beta=beta
+        )
 
         # Apply to global model
         with torch.no_grad():
             for name, param in self.global_trainer.model.named_parameters():
-                if name in averaged_deltas:
-                    param.data.add_(averaged_deltas[name].to(param.device))
+                if name in aggregated_delta:
+                    param.data.add_(aggregated_delta[name].to(param.device))
 
     # ------------------------------------------------------------------
     # Override — keep update_clients working correctly

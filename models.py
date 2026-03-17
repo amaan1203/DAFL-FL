@@ -1,7 +1,68 @@
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 import torchvision.models as models
+
+
+# ─── Deep BatchNorm (FastAI blog) ────────────────────────────────────────────
+
+class BnLayer(nn.Module):
+    """Single conv + custom per-channel batch-norm layer."""
+    def __init__(self, ni, nf, stride=2, kernel_size=3):
+        super().__init__()
+        self.conv = nn.Conv2d(ni, nf, kernel_size=kernel_size,
+                              stride=stride, bias=False, padding=1)
+        self.a = nn.Parameter(torch.zeros(nf, 1, 1))
+        self.m = nn.Parameter(torch.ones(nf, 1, 1))
+        # Running stats (initialised lazily on first forward pass)
+        self.register_buffer('means', torch.zeros(nf, 1, 1))
+        self.register_buffer('stds',  torch.ones(nf, 1, 1))
+
+    def forward(self, x):
+        x = F.relu(self.conv(x))
+        x_chan = x.transpose(0, 1).contiguous().view(x.size(1), -1)
+        if self.training:
+            self.means = x_chan.mean(1)[:, None, None].detach()
+            self.stds  = x_chan.std(1)[:, None, None].clamp(min=1e-5).detach()
+        return (x - self.means) / self.stds * self.m + self.a
+
+
+class ConvBnNet2(nn.Module):
+    """Deep BatchNorm Layered Model for CIFAR-10 (FastAI blog).
+
+    Typical call: ConvBnNet2([10, 20, 40, 80], 10)
+    Architecture:
+      conv1 (3→10, 5×5) → pairs of (BnLayer stride-2, BnLayer stride-1)
+      → AdaptiveMaxPool → Linear → log_softmax
+    Param count: ~330 K with [10,20,40,80]
+    """
+    def __init__(self, layers, c):
+        super().__init__()
+        self.conv1 = nn.Conv2d(3, 10, kernel_size=5, stride=1, padding=2)
+        self.layers = nn.ModuleList([
+            BnLayer(layers[i], layers[i + 1])
+            for i in range(len(layers) - 1)
+        ])
+        self.layers2 = nn.ModuleList([
+            BnLayer(layers[i + 1], layers[i + 1], stride=1)
+            for i in range(len(layers) - 1)
+        ])
+        self.out = nn.Linear(layers[-1], c)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        for l, l2 in zip(self.layers, self.layers2):
+            x = l(x)
+            x = l2(x)
+        x = F.adaptive_max_pool2d(x, 1)
+        x = x.view(x.size(0), -1)
+        return F.log_softmax(self.out(x), dim=-1)
+
+
+def get_cifar10_dbn(n_classes=10):
+    """Return a ConvBnNet2 instance configured for n_classes."""
+    return ConvBnNet2([10, 20, 40, 80], n_classes)
 
 
 class LinearLayer(nn.Module):
@@ -31,10 +92,12 @@ class FemnistCNN(nn.Module):
         self.pool = nn.MaxPool2d(2, 2)
         self.conv2 = nn.Conv2d(32, 64, 5)
 
-        self.fc1 = nn.Linear(64 * 4 * 4, 2048)
-        self.output = nn.Linear(2048, num_classes)
+        self.fc1 = nn.Linear(64 * 4 * 4, 512)
+        self.output = nn.Linear(512, num_classes)
 
     def forward(self, x):
+        if x.dim() == 2:
+            x = x.view(-1, 1, 28, 28)
         x = self.pool(F.relu(self.conv1(x)))
         x = self.pool(F.relu(self.conv2(x)))
         x = x.view(-1, 64 * 4 * 4)
